@@ -1,9 +1,19 @@
 {
-	"name": "pi-video-analyser",
+	"name": "@toninho09/pi-video-analyser",
 	"version": "0.1.0",
 	"description": "Pi extension: analyse local video files with a configured model through an OpenAI-compatible endpoint",
 	"license": "MIT",
 	"type": "module",
+	"author": "Antonio Lorenzon (https://github.com/toninho09)",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/toninho09/pi-video-analyzer.git"
+	},
+	"homepage": "https://github.com/toninho09/pi-video-analyzer#readme",
+	"bugs": "https://github.com/toninho09/pi-video-analyzer/issues",
+	"publishConfig": {
+		"access": "public"
+	},
 	"keywords": [
 		"pi-package",
 		"pi",
@@ -18,7 +28,8 @@
 	},
 	"scripts": {
 		"typecheck": "tsc --noEmit",
-		"test": "node --test test/*.test.ts"
+		"test": "node --test test/*.test.ts",
+		"prepublishOnly": "npm run typecheck && npm test"
 	},
 	"dependencies": {
 		"openai": "^7.30.0"

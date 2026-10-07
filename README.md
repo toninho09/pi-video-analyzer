@@ -18,7 +18,7 @@ OpenAI-compat layer, and other compatible endpoints.
 ## Install
 
 ```sh
-pi add npm:pi-video-analyser
+pi add npm:@toninho09/pi-video-analyser
 ```
 
 Or from a git checkout:
