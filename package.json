@@ -17,7 +17,8 @@
 		]
 	},
 	"scripts": {
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "node --test test/*.test.ts"
 	},
 	"dependencies": {
 		"openai": "^7.30.0"

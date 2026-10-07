@@ -6,13 +6,13 @@
  * headers, and base URL that Pi already resolved for the chosen provider.
  */
 
-import { existsSync, statSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
-import OpenAI from "openai";
-import type { Usage } from "@earendil-works/pi-ai";
+import { type Api, calculateCost, type Model, type Usage } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import type { VideoAnalyserSettings } from "./settings";
+import OpenAI from "openai";
+import type { VideoAnalyserSettings } from "./settings.ts";
 
 /** File extensions accepted by the tool, mapped to their MIME type. */
 const VIDEO_MIME: Record<string, string> = {
@@ -23,7 +23,11 @@ const VIDEO_MIME: Record<string, string> = {
 	".mkv": "video/x-matroska",
 };
 
+/** HTTP statuses that typically mean the endpoint rejected the video payload itself. */
+const VIDEO_REJECTION_STATUSES = new Set([400, 415, 422]);
+
 const SETTINGS_HINT = "Run /pi-video-analyser:settings to pick one.";
+const ABORTED_MESSAGE = "Video analysis was aborted.";
 
 export interface AnalyseResult {
 	/** The analysis text returned by the model. */
@@ -38,11 +42,57 @@ export interface AnalyseResult {
 	usage?: Usage;
 }
 
+export interface VideoFile {
+	path: string;
+	mime: string;
+	bytes: number;
+}
+
 function formatMb(bytes: number): string {
 	return (bytes / (1024 * 1024)).toFixed(1);
 }
 
-function extractText(content: unknown): string {
+/** Resolve a user-supplied path against the session cwd, expanding a leading "~". */
+export function resolveVideoPath(videoPath: string, cwd: string): string {
+	const expanded =
+		videoPath === "~" || videoPath.startsWith("~/") ? path.join(homedir(), videoPath.slice(1)) : videoPath;
+	return path.resolve(cwd, expanded);
+}
+
+/** Check that the file exists, is a supported video, and fits the size limit. */
+export async function inspectVideoFile(resolvedPath: string, maxVideoMb: number): Promise<VideoFile> {
+	let stats: Awaited<ReturnType<typeof stat>>;
+	try {
+		stats = await stat(resolvedPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			throw new Error(`Video file not found: ${resolvedPath}`);
+		}
+		throw error;
+	}
+	if (!stats.isFile()) {
+		throw new Error(`Not a regular file: ${resolvedPath}`);
+	}
+	if (stats.size === 0) {
+		throw new Error(`Video file is empty: ${resolvedPath}`);
+	}
+	const extension = path.extname(resolvedPath);
+	const mime = VIDEO_MIME[extension.toLowerCase()];
+	if (!mime) {
+		throw new Error(
+			`Unsupported video format "${extension || path.basename(resolvedPath)}". Supported: ${Object.keys(VIDEO_MIME).join(", ")}.`,
+		);
+	}
+	if (stats.size > maxVideoMb * 1024 * 1024) {
+		throw new Error(
+			`Video is ${formatMb(stats.size)} MB, over the ${maxVideoMb} MB limit. ` +
+				`Raise the limit with /pi-video-analyser:settings or use a smaller file.`,
+		);
+	}
+	return { path: resolvedPath, mime, bytes: stats.size };
+}
+
+export function extractText(content: unknown): string {
 	if (typeof content === "string") {
 		return content;
 	}
@@ -59,23 +109,25 @@ function extractText(content: unknown): string {
 	return "";
 }
 
-function mapUsage(usage: OpenAI.CompletionUsage | null | undefined): Usage | undefined {
+export function mapUsage(usage: OpenAI.CompletionUsage | null | undefined, model: Model<Api>): Usage | undefined {
 	if (!usage) {
 		return undefined;
 	}
-	const input = usage.prompt_tokens ?? 0;
-	const output = usage.completion_tokens ?? 0;
+	// prompt_tokens includes cached tokens; Pi counts them separately.
+	const promptTokens = usage.prompt_tokens ?? 0;
 	const cacheRead = usage.prompt_tokens_details?.cached_tokens ?? 0;
-	return {
+	const input = Math.max(0, promptTokens - cacheRead);
+	const output = usage.completion_tokens ?? 0;
+	const mapped: Usage = {
 		input,
 		output,
 		cacheRead,
 		cacheWrite: 0,
-		totalTokens: usage.total_tokens ?? input + output,
-		// Cost stays zero: prices come from Pi's catalog, which this direct
-		// call does not consult. Token counts still land in session totals.
+		totalTokens: usage.total_tokens ?? promptTokens + output,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+	mapped.cost = calculateCost(model, mapped);
+	return mapped;
 }
 
 /**
@@ -85,6 +137,7 @@ function mapUsage(usage: OpenAI.CompletionUsage | null | undefined): Usage | und
 export async function analyseVideo(
 	registry: ModelRegistry,
 	settings: VideoAnalyserSettings,
+	cwd: string,
 	videoPath: string,
 	prompt: string,
 	signal: AbortSignal | undefined,
@@ -99,52 +152,40 @@ export async function analyseVideo(
 			`Model ${settings.provider}/${settings.modelId} is no longer available. ${SETTINGS_HINT}`,
 		);
 	}
-	if (!registry.hasConfiguredAuth(model)) {
-		throw new Error(
-			`No authentication configured for provider "${settings.provider}". Run /login or set its API key.`,
-		);
-	}
 
+	// Keyless endpoints (local vLLM/Ollama) resolve fine here without stored credentials.
 	const auth = await registry.getApiKeyAndHeaders(model);
 	if (!auth.ok) {
-		throw new Error(`Could not resolve credentials for ${settings.provider}: ${auth.error}`);
+		throw new Error(
+			`Could not resolve credentials for "${settings.provider}": ${auth.error}. Run /login or set its API key.`,
+		);
 	}
 	const baseUrl = auth.baseUrl ?? model.baseUrl;
 	if (!baseUrl) {
 		throw new Error(`Provider "${settings.provider}" exposes no base URL for direct calls.`);
 	}
 
-	const resolvedPath = path.resolve(videoPath);
-	if (!existsSync(resolvedPath)) {
-		throw new Error(`Video file not found: ${resolvedPath}`);
-	}
-	const stat = statSync(resolvedPath);
-	if (!stat.isFile()) {
-		throw new Error(`Not a regular file: ${resolvedPath}`);
-	}
-	if (stat.size === 0) {
-		throw new Error(`Video file is empty: ${resolvedPath}`);
-	}
-	const mime = VIDEO_MIME[path.extname(resolvedPath).toLowerCase()];
-	if (!mime) {
-		throw new Error(
-			`Unsupported video format "${path.extname(resolvedPath) || path.basename(resolvedPath)}". Supported: ${Object.keys(VIDEO_MIME).join(", ")}.`,
-		);
-	}
-	const maxBytes = settings.maxVideoMb * 1024 * 1024;
-	if (stat.size > maxBytes) {
-		throw new Error(
-			`Video is ${formatMb(stat.size)} MB, over the ${settings.maxVideoMb} MB limit. ` +
-				`Raise the limit with /pi-video-analyser:settings or use a smaller file.`,
-		);
-	}
+	const video = await inspectVideoFile(resolveVideoPath(videoPath, cwd), settings.maxVideoMb);
 
-	// Async read keeps the TUI responsive while large files load.
-	const dataUrl = `data:${mime};base64,${(await readFile(resolvedPath)).toString("base64")}`;
+	let data: Buffer;
+	try {
+		data = await readFile(video.path, { signal });
+	} catch (error) {
+		if (signal?.aborted) {
+			throw new Error(ABORTED_MESSAGE);
+		}
+		throw error;
+	}
+	const dataUrl = `data:${video.mime};base64,${data.toString("base64")}`;
 	const client = new OpenAI({
-		apiKey: auth.apiKey ?? "",
+		// The SDK requires a non-empty key even when Pi authenticates via headers.
+		apiKey: auth.apiKey || "unused",
 		baseURL: baseUrl,
-		defaultHeaders: auth.headers,
+		defaultHeaders: {
+			// Never send the placeholder key; Pi's resolved headers take precedence.
+			...(!auth.apiKey ? { Authorization: null } : {}),
+			...auth.headers,
+		},
 		// Retries would re-upload the whole video; fail fast instead.
 		maxRetries: 0,
 	});
@@ -173,20 +214,24 @@ export async function analyseVideo(
 		);
 	} catch (error) {
 		if (signal?.aborted || error instanceof OpenAI.APIUserAbortError) {
-			throw new Error("Video analysis was aborted.");
+			throw new Error(ABORTED_MESSAGE);
 		}
 		if (error instanceof OpenAI.APIConnectionTimeoutError) {
 			throw new Error(`Video analysis timed out after ${settings.timeoutSeconds}s.`);
 		}
 		if (error instanceof OpenAI.APIError) {
+			const hints: string[] = [];
+			if (error.status && VIDEO_REJECTION_STATUSES.has(error.status)) {
+				hints.push(`The endpoint may not accept video_url input for ${model.id}.`);
+			}
+			if (model.api === "openai-responses" && error.status === 404) {
+				hints.push(
+					"This provider is registered for the Responses API and its endpoint may not expose chat/completions — pick a model on an openai-completions provider instead.",
+				);
+			}
 			const status = error.status ? ` [HTTP ${error.status}]` : "";
-			const responsesHint =
-				model.api === "openai-responses" && error.status === 404
-					? " This provider is registered for the Responses API and its endpoint may not expose chat/completions — pick a model on an openai-completions provider instead."
-					: "";
-			throw new Error(
-				`${error.message}${status} — the endpoint may not accept video_url input for ${model.id}.${responsesHint}`,
-			);
+			const hint = hints.length > 0 ? ` — ${hints.join(" ")}` : "";
+			throw new Error(`${error.message}${status}${hint}`);
 		}
 		throw error instanceof Error ? error : new Error(String(error));
 	}
@@ -195,8 +240,8 @@ export async function analyseVideo(
 	return {
 		text: text || "(The model returned an empty response.)",
 		model: `${model.provider}/${model.id}`,
-		bytes: stat.size,
+		bytes: video.bytes,
 		durationMs: Date.now() - startedAt,
-		usage: mapUsage(response.usage),
+		usage: mapUsage(response.usage, model),
 	};
 }

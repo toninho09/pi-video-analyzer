@@ -38,17 +38,33 @@ Run the settings wizard in an interactive Pi session:
 The model picker is searchable: type to fuzzy-filter (e.g. `gemini flash`,
 `gpt4o`) over `provider / model-id` and the model's display name, navigate with
 the arrow keys, and press Enter to select. The saved model is marked
-`current`; providers without credentials are marked `no auth`. In RPC
-sessions (no custom components), the wizard asks for a search query first and
-then lists the matching models.
+`current`. Only models Pi reports as available with configured authentication
+are listed; sign in with `/login` or configure credentials in Pi first. In RPC
+sessions (no custom components), the wizard asks for a search query when there
+are more than 30 models and then lists the matches. A search with no matches
+asks again, so you can refine it or cancel.
 
-It persists to `~/.pi/agent/pi-video-analyser.json`:
+Each numeric prompt is pre-filled with the current value; submitting it empty
+keeps the current value.
+
+It persists to `pi-video-analyser.json` in Pi's agent directory
+(`~/.pi/agent/` by default, or `$PI_CODING_AGENT_DIR`):
 
 | Setting         | Default | Range     | Meaning                                |
 | --------------- | ------- | --------- | -------------------------------------- |
-| model           | —       | —         | Any model on an OpenAI-compatible provider (openai, openrouter, vLLM, Ollama, custom `models.json` entries, …) |
-| max video size  | 50 MB   | 1–500     | Hard cap; larger files fail fast       |
+| model           | —       | —         | An available, authenticated model on an OpenAI-compatible provider |
+| max video size  | 50 MB   | 1–350     | Hard cap; larger files fail fast       |
 | timeout         | 300 s   | 5–3600    | Request timeout for the analysis call  |
+
+Out-of-range values in a hand-edited file are clamped to the range; a file
+that is not valid JSON makes the tool fail with the path to fix (re-running
+the wizard overwrites it).
+
+The 350 MB ceiling comes from the transport: the video is sent base64-encoded
+inside the JSON request, and Node cannot build strings much past ~384 MB of
+raw video. Most providers accept far less inline — some OpenAI-compatible
+endpoints cap request bodies around 20 MB — so check your provider's limit
+before raising the default.
 
 The model picker only lists providers whose API is `openai-completions` or
 `openai-responses`; native Anthropic/Google/Azure providers are excluded
@@ -59,6 +75,12 @@ gateways) rely on that endpoint being exposed as well — every provider in
 Pi's catalog does, but a custom Responses-only endpoint fails with an error
 suggesting an `openai-completions` model instead.
 
+Being on a compatible API does not mean the model accepts video: Pi's
+catalog only tracks text and image input, so the picker cannot filter by
+video support. Pick a model whose provider documents video input (e.g.
+Gemini models via OpenRouter or Google's OpenAI-compat layer); OpenAI's own
+chat models do not accept `video_url`.
+
 ## Use
 
 Ask the agent, for example:
@@ -67,10 +89,13 @@ Ask the agent, for example:
 
 Tool parameters:
 
-- `path` — local video file (`.mp4`, `.webm`, `.mov`, `.m4v`, `.mkv`)
+- `path` — local video file (`.mp4`, `.webm`, `.mov`, `.m4v`, `.mkv`),
+  relative to the session's working directory; a leading `~` is expanded
 - `prompt` — what to analyse
 
-Token usage reported by the endpoint is folded into the session totals.
+Token usage reported by the endpoint, and its cost from Pi's model catalog,
+are folded into the session totals. Calls run one at a time, since each holds
+the whole video in memory.
 
 ## Failure modes
 
@@ -79,8 +104,9 @@ Token usage reported by the endpoint is folded into the session totals.
 | Video over the size limit        | Error with actual size, the limit, and where to change it        |
 | Unsupported extension / no file  | Error listing accepted formats / the resolved path               |
 | No model configured (yet)        | Error pointing at `/pi-video-analyser:settings`                  |
+| Settings file is not valid JSON  | Error with the file path; the wizard starts from defaults        |
 | Model removed / no credentials   | Error naming the provider and the fix (`/login`, re-run settings)|
-| Endpoint rejects `video_url`     | Provider error passed through with a hint                        |
+| Endpoint rejects `video_url`     | Provider error passed through; HTTP 400/415/422 add a video hint |
 | Timeout / aborted turn           | Clear timeout/abort message; the upload is never retried         |
 
 The tool itself works in headless modes (`pi -p …`); only the settings wizard
@@ -91,6 +117,7 @@ requires an interactive session.
 ```sh
 npm install
 npm run typecheck
+npm test
 pi --extension .   # load straight from the checkout
 ```
 
